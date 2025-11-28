@@ -2,6 +2,8 @@
 
 A PowerShell script that cross-references your local movie folders with your Trakt.tv watch history to identify watched and unwatched content, helping you make informed cleanup decisions.
 
+<img width="991" height="688" alt="image" src="https://github.com/user-attachments/assets/eb1598b2-a709-4eb8-a1f2-92dd206c3e94" />
+
 ## Features
 
 - **Trakt Integration** - OAuth authentication with automatic token refresh
