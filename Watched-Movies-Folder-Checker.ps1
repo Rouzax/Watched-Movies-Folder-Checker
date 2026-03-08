@@ -228,7 +228,7 @@ function Import-Configuration {
 
             if ($fileConfig.rootFolders) { $config.RootFolders = @($fileConfig.rootFolders) }
             if ($fileConfig.excludePatterns) { $config.ExcludePatterns = @($fileConfig.excludePatterns) }
-            if ($fileConfig.cacheTTLHours) { $config.CacheTTLHours = [int]$fileConfig.cacheTTLHours }
+            if ($null -ne $fileConfig.cacheTTLHours) { $config.CacheTTLHours = [int]$fileConfig.cacheTTLHours }
             if ($fileConfig.outputFormat) { $config.OutputFormat = $fileConfig.outputFormat }
             if ($fileConfig.videoExtensions) { $config.VideoExtensions = @($fileConfig.videoExtensions) }
             if ($fileConfig.trailingArticles) { $config.TrailingArticles = @($fileConfig.trailingArticles) }
@@ -599,6 +599,7 @@ function New-TraktHeaders {
         'Content-Type'      = 'application/json'
         'trakt-api-version' = $script:TraktApi.Version
         'trakt-api-key'     = $script:State.ClientId
+        'User-Agent'        = 'WatchedMoviesFolderChecker/1.0'
     }
 
     if ($IncludeAuth -and $script:State.AccessToken) {
@@ -638,7 +639,11 @@ function Invoke-TraktRequest {
     }
 
     try {
-        return Invoke-RestMethod @invokeParams
+        $response = Invoke-RestMethod @invokeParams
+        if ($response -is [string] -and $response -match '<!DOCTYPE|<html|cloudflare') {
+            throw "Trakt API returned HTML instead of JSON (possible Cloudflare block). Try again later."
+        }
+        return $response
     }
     catch {
         $statusCode = $null
@@ -653,7 +658,26 @@ function Invoke-TraktRequest {
 
             # Rebuild headers with new token and retry
             $invokeParams['Headers'] = New-TraktHeaders -IncludeAuth
-            return Invoke-RestMethod @invokeParams
+            $response = Invoke-RestMethod @invokeParams
+            if ($response -is [string] -and $response -match '<!DOCTYPE|<html|cloudflare') {
+                throw "Trakt API returned HTML instead of JSON (possible Cloudflare block). Try again later."
+            }
+            return $response
+        }
+
+        # Retry once on 429 rate limit with backoff
+        if ($statusCode -eq 429) {
+            $retryAfter = 10
+            if ($_.Exception.Response.Headers['Retry-After']) {
+                $retryAfter = [int]$_.Exception.Response.Headers['Retry-After']
+            }
+            Write-Warning "Rate limited by Trakt. Waiting $retryAfter seconds..."
+            Start-Sleep -Seconds $retryAfter
+            $response = Invoke-RestMethod @invokeParams
+            if ($response -is [string] -and $response -match '<!DOCTYPE|<html|cloudflare') {
+                throw "Trakt API returned HTML instead of JSON (possible Cloudflare block). Try again later."
+            }
+            return $response
         }
 
         throw
@@ -940,7 +964,7 @@ function Get-MovieData {
 
     # Invalidate cache if disk size changed
     $sizeChanged = $false
-    if ($cached -and $cached.total_bytes -and $cached.total_bytes -ne $currentTotalBytes) {
+    if ($cached -and $null -ne $cached.total_bytes -and $cached.total_bytes -ne $currentTotalBytes) {
         $sizeChanged = $true
         Write-Verbose "  Disk content changed (cached: $($cached.total_bytes) bytes, current: $currentTotalBytes bytes)"
     }
@@ -1169,14 +1193,15 @@ function Write-Summary {
     param([Parameter(Mandatory)][array]$MoviesData)
 
     $totalMovies = $MoviesData.Count
-    $watched = ($MoviesData | Where-Object { $_.Status -eq $script:WatchStatus.Watched }).Count
-    $unwatched = ($MoviesData | Where-Object { $_.Status -eq $script:WatchStatus.Unwatched }).Count
-    $unknown = ($MoviesData | Where-Object { $_.Status -like "Unknown*" }).Count
+    $watched = @($MoviesData | Where-Object { $_.Status -eq $script:WatchStatus.Watched }).Count
+    $unwatched = @($MoviesData | Where-Object { $_.Status -eq $script:WatchStatus.Unwatched }).Count
+    $unknown = @($MoviesData | Where-Object { $_.Status -like "Unknown*" }).Count
 
     $totalSize = ($MoviesData | Measure-Object -Property SizeGB -Sum).Sum
     $watchedSize = ($MoviesData | Where-Object { $_.Status -eq $script:WatchStatus.Watched } | Measure-Object -Property SizeGB -Sum).Sum
     $unwatchedSize = ($MoviesData | Where-Object { $_.Status -eq $script:WatchStatus.Unwatched } | Measure-Object -Property SizeGB -Sum).Sum
 
+    if (-not $totalSize) { $totalSize = 0 }
     if (-not $watchedSize) { $watchedSize = 0 }
     if (-not $unwatchedSize) { $unwatchedSize = 0 }
 
@@ -1269,12 +1294,28 @@ try {
     # Initialize authentication
     Initialize-TraktAuth
 
+    # Verify authenticated user
+    try {
+        $me = Invoke-TraktRequest -Endpoint '/users/me'
+        Write-Host "Authenticated as Trakt user: $($me.username)" -ForegroundColor Cyan
+    }
+    catch {
+        Write-Warning "Could not verify Trakt user: $_"
+    }
+
     # Load cache
     $script:State.Cache = Import-MovieCache
 
     # Fetch watched movies list once (used for all movies)
     Write-Host "Fetching watched movies from Trakt..." -ForegroundColor Cyan
-    $watchedMoviesRaw = @(Get-TraktWatchedMovies)
+    $watchedMoviesRaw = Get-TraktWatchedMovies
+    if ($null -eq $watchedMoviesRaw) {
+        $watchedMoviesRaw = @()
+        Write-Warning "Failed to fetch watched movies from Trakt. All movies will show as unwatched."
+    }
+    else {
+        $watchedMoviesRaw = @($watchedMoviesRaw)
+    }
     Write-Host "Found $($watchedMoviesRaw.Count) watched movies on Trakt" -ForegroundColor Gray
     
     # Build lookup hashtables for fast matching
@@ -1375,7 +1416,7 @@ try {
         $selected = Export-Results -MoviesData $moviesData -Format 'GridView' -Interactive
 
         if ($selected) {
-            $candidates = $moviesData | Where-Object { $selected.Title -contains $_.Title }
+            $candidates = $moviesData | Where-Object { $selected.FolderPath -contains $_.FolderPath }
 
             if ($candidates.Count -gt 0) {
                 $totalSize = ($candidates | Measure-Object -Property SizeGB -Sum).Sum
