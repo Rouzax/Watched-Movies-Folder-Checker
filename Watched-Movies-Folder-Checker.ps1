@@ -723,11 +723,19 @@ function Find-TraktMovie {
         }
     }
 
-    # Search with original title
+    # Search with original title (include year filter when available for better results)
     $encoded = [uri]::EscapeDataString($Title)
-    Write-Verbose "  Searching Trakt for: $Title"
-    $results = Invoke-TraktRequest -Endpoint "/search/movie?query=$encoded"
+    $yearFilter = if ($Year) { "&years=$Year" } else { '' }
+    Write-Verbose "  Searching Trakt for: $Title$(if ($Year) { " ($Year)" })"
+    $results = Invoke-TraktRequest -Endpoint "/search/movie?query=$encoded$yearFilter"
     $candidates = @($results)
+
+    # If no results with year filter, retry without it
+    if ($candidates.Count -eq 0 -and $Year) {
+        Write-Verbose "  No results with year filter, retrying without year..."
+        $results = Invoke-TraktRequest -Endpoint "/search/movie?query=$encoded"
+        $candidates = @($results)
+    }
 
     # If no results and title contains punctuation, try without it
     if ($candidates.Count -eq 0 -and $Title -match '[,;:!?]') {
@@ -769,13 +777,30 @@ function Find-TraktMovie {
     if ($titleMatch) { return $titleMatch[0] }
 
     # Title match (normalized)
-    $normalizedTitleMatch = $candidates | Where-Object { 
-        (& $normalize $_.movie.title) -eq $normalizedTitle 
+    $normalizedTitleMatch = $candidates | Where-Object {
+        (& $normalize $_.movie.title) -eq $normalizedTitle
     }
     if ($normalizedTitleMatch) { return $normalizedTitleMatch[0] }
 
-    # Fall back to first result
-    return $candidates[0]
+    # Fall back to first result only if it shares significant title words
+    # This prevents matching "Arthur the King" to "King Arthur: Legend of the Sword"
+    $localWords = @($normalizedTitle -split '\s+' | Where-Object { $_.Length -gt 2 })
+    $bestCandidate = $candidates[0]
+    $candidateNormalized = & $normalize $bestCandidate.movie.title
+    $candidateWords = @($candidateNormalized -split '\s+' | Where-Object { $_.Length -gt 2 })
+
+    if ($localWords.Count -gt 0 -and $candidateWords.Count -gt 0) {
+        $commonWords = @($localWords | Where-Object { $candidateWords -contains $_ })
+        # Require that at least half of the local title words appear in the candidate
+        $overlapRatio = $commonWords.Count / $localWords.Count
+        if ($overlapRatio -ge 0.5) {
+            return $bestCandidate
+        }
+        Write-Warning "  No confident match for '$Title' — best candidate '$($bestCandidate.movie.title) ($($bestCandidate.movie.year))' has low title similarity. Use manualMappings in config to map this folder."
+        return $null
+    }
+
+    return $bestCandidate
 }
 
 function Get-TraktMovieDetails {
