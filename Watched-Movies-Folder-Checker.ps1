@@ -723,19 +723,14 @@ function Find-TraktMovie {
         }
     }
 
-    # Search with original title (include year filter when available for better results)
-    $encoded = [uri]::EscapeDataString($Title)
-    $yearFilter = if ($Year) { "&years=$Year" } else { '' }
-    Write-Verbose "  Searching Trakt for: $Title$(if ($Year) { " ($Year)" })"
-    $results = Invoke-TraktRequest -Endpoint "/search/movie?query=$encoded$yearFilter"
-    $candidates = @($results)
+    # Normalize function for comparison (lowercase, remove punctuation)
+    $normalize = { param($s) ($s -replace '[^a-zA-Z0-9\s]', '' -replace '\s+', ' ').Trim().ToLowerInvariant() }
 
-    # If no results with year filter, retry without it
-    if ($candidates.Count -eq 0 -and $Year) {
-        Write-Verbose "  No results with year filter, retrying without year..."
-        $results = Invoke-TraktRequest -Endpoint "/search/movie?query=$encoded"
-        $candidates = @($results)
-    }
+    # Search Trakt text search API
+    $encoded = [uri]::EscapeDataString($Title)
+    Write-Verbose "  Searching Trakt for: $Title$(if ($Year) { " ($Year)" })"
+    $results = Invoke-TraktRequest -Endpoint "/search/movie?query=$encoded"
+    $candidates = @($results)
 
     # If no results and title contains punctuation, try without it
     if ($candidates.Count -eq 0 -and $Title -match '[,;:!?]') {
@@ -746,61 +741,69 @@ function Find-TraktMovie {
         $candidates = @($results)
     }
 
-    if ($candidates.Count -eq 0) {
-        return $null
-    }
-
-    # Normalize function for comparison (lowercase, remove punctuation)
-    $normalize = { param($s) ($s -replace '[^a-zA-Z0-9\s]', '' -replace '\s+', ' ').Trim().ToLowerInvariant() }
-
     $normalizedTitle = & $normalize $Title
 
-    # Priority: exact title+year > normalized title+year > year match > title match > first result
+    # Try to find a confident match from search results
+    if ($candidates.Count -gt 0) {
+        if ($Year) {
+            # Exact match
+            $exact = $candidates | Where-Object { $_.movie.title -eq $Title -and $_.movie.year -eq $Year }
+            if ($exact) { return $exact[0] }
+
+            # Normalized match with year
+            $normalizedMatch = $candidates | Where-Object {
+                (& $normalize $_.movie.title) -eq $normalizedTitle -and $_.movie.year -eq $Year
+            }
+            if ($normalizedMatch) { return $normalizedMatch[0] }
+
+            # Just year match
+            $yearMatch = $candidates | Where-Object { $_.movie.year -eq $Year }
+            if ($yearMatch) { return $yearMatch[0] }
+        }
+
+        # Title match (exact)
+        $titleMatch = $candidates | Where-Object { $_.movie.title -eq $Title }
+        if ($titleMatch) { return $titleMatch[0] }
+
+        # Title match (normalized)
+        $normalizedTitleMatch = $candidates | Where-Object {
+            (& $normalize $_.movie.title) -eq $normalizedTitle
+        }
+        if ($normalizedTitleMatch) { return $normalizedTitleMatch[0] }
+    }
+
+    # Slug-based direct lookup fallback — Trakt text search can miss movies that
+    # exist under a clean slug (e.g. "Arthur the King" not found by search but
+    # exists at /movies/arthur-the-king-2024)
     if ($Year) {
-        # Exact match
-        $exact = $candidates | Where-Object { $_.movie.title -eq $Title -and $_.movie.year -eq $Year }
-        if ($exact) { return $exact[0] }
-
-        # Normalized match with year
-        $normalizedMatch = $candidates | Where-Object { 
-            (& $normalize $_.movie.title) -eq $normalizedTitle -and $_.movie.year -eq $Year 
+        $slug = (($Title -replace '[^a-zA-Z0-9\s]', '' -replace '\s+', '-').ToLowerInvariant()) + "-$Year"
+        Write-Verbose "  Search inconclusive, trying slug lookup: $slug"
+        try {
+            $slugResult = Invoke-TraktRequest -Endpoint "/movies/$slug"
+            if ($slugResult -and $slugResult.title) {
+                Write-Verbose "  Found via slug: $($slugResult.title) ($($slugResult.year))"
+                return @{
+                    movie = @{
+                        ids   = $slugResult.ids
+                        title = $slugResult.title
+                        year  = $slugResult.year
+                    }
+                }
+            }
         }
-        if ($normalizedMatch) { return $normalizedMatch[0] }
-
-        # Just year match
-        $yearMatch = $candidates | Where-Object { $_.movie.year -eq $Year }
-        if ($yearMatch) { return $yearMatch[0] }
-    }
-
-    # Title match (exact)
-    $titleMatch = $candidates | Where-Object { $_.movie.title -eq $Title }
-    if ($titleMatch) { return $titleMatch[0] }
-
-    # Title match (normalized)
-    $normalizedTitleMatch = $candidates | Where-Object {
-        (& $normalize $_.movie.title) -eq $normalizedTitle
-    }
-    if ($normalizedTitleMatch) { return $normalizedTitleMatch[0] }
-
-    # Fall back to first result only if it shares significant title words
-    # This prevents matching "Arthur the King" to "King Arthur: Legend of the Sword"
-    $localWords = @($normalizedTitle -split '\s+' | Where-Object { $_.Length -gt 2 })
-    $bestCandidate = $candidates[0]
-    $candidateNormalized = & $normalize $bestCandidate.movie.title
-    $candidateWords = @($candidateNormalized -split '\s+' | Where-Object { $_.Length -gt 2 })
-
-    if ($localWords.Count -gt 0 -and $candidateWords.Count -gt 0) {
-        $commonWords = @($localWords | Where-Object { $candidateWords -contains $_ })
-        # Require that at least half of the local title words appear in the candidate
-        $overlapRatio = $commonWords.Count / $localWords.Count
-        if ($overlapRatio -ge 0.5) {
-            return $bestCandidate
+        catch {
+            Write-Verbose "  Slug lookup failed for: $slug"
         }
-        Write-Warning "  No confident match for '$Title' — best candidate '$($bestCandidate.movie.title) ($($bestCandidate.movie.year))' has low title similarity. Use manualMappings in config to map this folder."
-        return $null
     }
 
-    return $bestCandidate
+    # Final fallback: accept first search result only if it has matching year
+    # Never blindly return a result with a different year — that causes wrong matches
+    if ($candidates.Count -gt 0 -and -not $Year) {
+        return $candidates[0]
+    }
+
+    Write-Warning "  No confident match for '$Title$(if ($Year) { " ($Year)" })'. Use manualMappings in config to map this folder."
+    return $null
 }
 
 function Get-TraktMovieDetails {
